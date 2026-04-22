@@ -3,7 +3,7 @@ PDF → Markdown batch converter
 Uses GPT-4o vision (page-by-page images) to handle text, tables, graphs, and diagrams.
 
 Requirements:
-    pip install openai pypdf pdf2image pillow
+    pip install openai pdf2image pillow
     Also needs poppler installed:
         macOS:   brew install poppler
         Ubuntu:  apt install poppler-utils
@@ -21,29 +21,42 @@ import os
 import sys
 import base64
 import time
+import threading
 from pathlib import Path
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
 from pdf2image import convert_from_path
 from PIL import Image
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise ValueError("Set the OPENAI_API_KEY environment variable")   # set via env var or paste here
-MODEL = "gpt-4o"
-MAX_TOKENS = 4096          # per page — increase if pages get cut off
-DPI = 150                  # resolution for rasterising pages (150 is a good balance)
-OUTPUT_SUFFIX = "_md"      # input folder + this suffix = output folder
-SLEEP_BETWEEN_PAGES = 0.3  # seconds — avoids rate-limit bursts on big docs
+    raise ValueError("Set the OPENAI_API_KEY environment variable")
+MODEL               = "gpt-4o"
+MAX_TOKENS          = 4096         # per page — increase if pages get cut off
+DPI                 = 100          # lowered from 150 for faster processing
+OUTPUT_SUFFIX       = "_md"        # input folder + this suffix = output folder
+SLEEP_BETWEEN_PAGES = 0.1          # seconds between pages within a PDF
+MAX_WORKERS         = 5            # PDFs processed in parallel — reduce to 3 if you hit rate limits
 # ───────────────────────────────────────────────────────────────────────────────
 
-PROMPT = """Take this PDF page as input and convert it into markdown.
-Do not leave any information out.
-For pictures and graphs, describe them in detail using markdown (e.g. use a caption block or a descriptive paragraph).
-Preserve tables using markdown table syntax.
+PROMPT = """Convert this PDF page to markdown for study notes.
+Include: core concepts and explanations, definitions, formulas and their meaning,
+examples, key arguments or reasoning, and detailed descriptions of any graphs,
+charts or diagrams.
+Exclude: administrative content, professor info, course logistics, deadlines,
+and decorative elements.
+Write clearly and preserve the logical structure of the content.
 Output only the markdown — no preamble, no explanation."""
+
+print_lock = threading.Lock()
+
+
+def log(msg: str):
+    with print_lock:
+        print(msg, flush=True)
 
 
 def encode_image_to_base64(image: Image.Image) -> str:
@@ -55,7 +68,7 @@ def encode_image_to_base64(image: Image.Image) -> str:
 
 def convert_pdf_to_md(pdf_path: Path, client: OpenAI) -> str:
     """Convert a single PDF file to markdown using GPT-4o vision page by page."""
-    print(f"  Converting: {pdf_path.name}")
+    log(f"  Converting: {pdf_path.name}")
 
     try:
         pages = convert_from_path(str(pdf_path), dpi=DPI)
@@ -65,7 +78,7 @@ def convert_pdf_to_md(pdf_path: Path, client: OpenAI) -> str:
     md_parts = []
 
     for i, page_img in enumerate(pages, start=1):
-        print(f"    Page {i}/{len(pages)}...", end=" ", flush=True)
+        log(f"    [{pdf_path.name}] Page {i}/{len(pages)}...")
         b64 = encode_image_to_base64(page_img)
 
         try:
@@ -90,15 +103,37 @@ def convert_pdf_to_md(pdf_path: Path, client: OpenAI) -> str:
             )
             page_md = response.choices[0].message.content.strip()
             md_parts.append(page_md)
-            print("done")
+            log(f"    [{pdf_path.name}] Page {i}/{len(pages)} done")
         except Exception as e:
             md_parts.append(f"<!-- Page {i} error: {e} -->")
-            print(f"error: {e}")
+            log(f"    [{pdf_path.name}] Page {i} error: {e}")
 
         if i < len(pages):
             time.sleep(SLEEP_BETWEEN_PAGES)
 
     return "\n\n---\n\n".join(md_parts)
+
+
+def process_pdf(pdf_path: Path, input_root: Path, output_root: Path, client: OpenAI, idx: int, total: int):
+    """Process a single PDF — called from thread pool."""
+    relative = pdf_path.relative_to(input_root)
+    out_dir  = output_root / relative.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / (pdf_path.stem + ".md")
+
+    if out_file.exists():
+        log(f"[{idx}/{total}] Skipping (already done): {relative}")
+        return
+
+    log(f"[{idx}/{total}] {relative}")
+    md_content = convert_pdf_to_md(pdf_path, client)
+
+    with open(out_file, "w", encoding="utf-8") as f:
+        f.write(f"# {pdf_path.stem}\n\n")
+        f.write(md_content)
+        f.write("\n")
+
+    log(f"  Saved → {out_file.relative_to(output_root.parent)}\n")
 
 
 def mirror_structure_and_convert(input_folder: str) -> None:
@@ -110,35 +145,31 @@ def mirror_structure_and_convert(input_folder: str) -> None:
     output_root = input_root.parent / (input_root.name + OUTPUT_SUFFIX)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    # Collect all PDFs first so we can show progress
+    client    = OpenAI(api_key=OPENAI_API_KEY)
     pdf_files = list(input_root.rglob("*.pdf"))
+
     if not pdf_files:
         print("No PDF files found in the folder.")
         return
 
-    print(f"Found {len(pdf_files)} PDF(s). Output → {output_root}\n")
+    total = len(pdf_files)
+    print(f"Found {total} PDF(s). Output → {output_root}")
+    print(f"Running with {MAX_WORKERS} parallel workers\n")
 
-    for idx, pdf_path in enumerate(pdf_files, start=1):
-        relative = pdf_path.relative_to(input_root)
-        out_dir = output_root / relative.parent
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_file = out_dir / (pdf_path.stem + ".md")
-
-        if out_file.exists():
-            print(f"[{idx}/{len(pdf_files)}] Skipping (already done): {relative}")
-            continue
-
-        print(f"[{idx}/{len(pdf_files)}] {relative}")
-        md_content = convert_pdf_to_md(pdf_path, client)
-
-        with open(out_file, "w", encoding="utf-8") as f:
-            f.write(f"# {pdf_path.stem}\n\n")
-            f.write(md_content)
-            f.write("\n")
-
-        print(f"  Saved → {out_file.relative_to(output_root.parent)}\n")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(process_pdf, pdf, input_root, output_root, client, idx, total): pdf
+            for idx, pdf in enumerate(pdf_files, start=1)
+        }
+        done = 0
+        for future in as_completed(futures):
+            done += 1
+            pdf = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                log(f"  [FATAL] {pdf.name} — {e}")
+            log(f"\nProgress: {done}/{total} PDFs completed\n")
 
     print("All done.")
 
