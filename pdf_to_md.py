@@ -1,9 +1,10 @@
 """
-PDF → Markdown batch converter
-Uses GPT-4o vision (page-by-page images) to handle text, tables, graphs, and diagrams.
+PDF → Markdown batch converter (hybrid mode)
+Extracts text directly when possible (fast), falls back to GPT-4o vision
+only for pages with images/graphs/diagrams.
 
 Requirements:
-    pip install openai pdf2image pillow
+    pip install openai pypdf pdf2image pillow
     Also needs poppler installed:
         macOS:   brew install poppler
         Ubuntu:  apt install poppler-utils
@@ -27,6 +28,7 @@ from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
+from pypdf import PdfReader
 from pdf2image import convert_from_path
 from PIL import Image
 
@@ -36,13 +38,26 @@ if not OPENAI_API_KEY:
     raise ValueError("Set the OPENAI_API_KEY environment variable")
 MODEL               = "gpt-4o"
 MAX_TOKENS          = 4096         # per page — increase if pages get cut off
-DPI                 = 100          # lowered from 150 for faster processing
+DPI                 = 100          # resolution for rasterising pages (vision fallback only)
 OUTPUT_SUFFIX       = "_md"        # input folder + this suffix = output folder
-SLEEP_BETWEEN_PAGES = 1          # seconds between pages within a PDF
-MAX_WORKERS         = 2           # PDFs processed in parallel — reduce to 3 if you hit rate limits
+SLEEP_BETWEEN_PAGES = 1            # seconds between API calls
+MAX_WORKERS         = 2            # PDFs processed in parallel
+MIN_TEXT_LENGTH     = 50           # pages with less text than this get sent to vision
 # ───────────────────────────────────────────────────────────────────────────────
 
-PROMPT = """Convert this PDF page to markdown for study notes.
+TEXT_PROMPT = """Convert this text from a PDF page into clean markdown for study notes.
+Include: core concepts and explanations, definitions, formulas and their meaning,
+examples, key arguments or reasoning.
+Exclude: administrative content, professor info, course logistics, deadlines,
+and decorative elements.
+Write clearly and preserve the logical structure of the content.
+Output only the markdown — no preamble, no explanation.
+
+Here is the text:
+
+"""
+
+VISION_PROMPT = """Convert this PDF page to markdown for study notes.
 Include: core concepts and explanations, definitions, formulas and their meaning,
 examples, key arguments or reasoning, and detailed descriptions of any graphs,
 charts or diagrams.
@@ -66,49 +81,114 @@ def encode_image_to_base64(image: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
+def page_has_images(page) -> bool:
+    """Check if a pypdf page contains embedded images."""
+    try:
+        xobjects = page.get("/Resources", {}).get("/XObject")
+        if xobjects is None:
+            return False
+        xobjects = xobjects.get_object()
+        for obj_name in xobjects:
+            obj = xobjects[obj_name].get_object()
+            if obj.get("/Subtype") == "/Image":
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def convert_page_text(text: str, client: OpenAI) -> str:
+    """Send extracted text to GPT-4o for markdown conversion (fast, no image)."""
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        messages=[
+            {"role": "user", "content": TEXT_PROMPT + text}
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
+def convert_page_vision(page_img: Image.Image, client: OpenAI) -> str:
+    """Send page image to GPT-4o vision for markdown conversion."""
+    b64 = encode_image_to_base64(page_img)
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64}",
+                            "detail": "high",
+                        },
+                    },
+                    {"type": "text", "text": VISION_PROMPT},
+                ],
+            }
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
 def convert_pdf_to_md(pdf_path: Path, client: OpenAI) -> str:
-    """Convert a single PDF file to markdown using GPT-4o vision page by page."""
+    """Convert a single PDF file to markdown, using text extraction or vision per page."""
     log(f"  Converting: {pdf_path.name}")
 
     try:
-        pages = convert_from_path(str(pdf_path), dpi=DPI)
+        reader = PdfReader(str(pdf_path))
     except Exception as e:
-        return f"# Error converting {pdf_path.name}\n\n{e}"
+        return f"# Error reading {pdf_path.name}\n\n{e}"
+
+    # Figure out which pages need vision (have images or no extractable text)
+    needs_vision = []
+    for i, page in enumerate(reader.pages):
+        text = (page.extract_text() or "").strip()
+        has_images = page_has_images(page)
+        if has_images or len(text) < MIN_TEXT_LENGTH:
+            needs_vision.append(i)
+
+    # Only rasterize if at least one page needs vision
+    vision_pages = {}
+    if needs_vision:
+        try:
+            all_images = convert_from_path(str(pdf_path), dpi=DPI)
+            for idx in needs_vision:
+                if idx < len(all_images):
+                    vision_pages[idx] = all_images[idx]
+        except Exception as e:
+            log(f"  [WARN] Could not rasterize {pdf_path.name}: {e}")
 
     md_parts = []
+    total_pages = len(reader.pages)
 
-    for i, page_img in enumerate(pages, start=1):
-        log(f"    [{pdf_path.name}] Page {i}/{len(pages)}...")
-        b64 = encode_image_to_base64(page_img)
+    for i, page in enumerate(reader.pages):
+        text = (page.extract_text() or "").strip()
+        use_vision = i in vision_pages
+
+        mode = "vision" if use_vision else "text"
+        log(f"    [{pdf_path.name}] Page {i+1}/{total_pages} ({mode})...")
 
         try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{b64}",
-                                    "detail": "high",
-                                },
-                            },
-                            {"type": "text", "text": PROMPT},
-                        ],
-                    }
-                ],
-            )
-            page_md = response.choices[0].message.content.strip()
-            md_parts.append(page_md)
-            log(f"    [{pdf_path.name}] Page {i}/{len(pages)} done")
-        except Exception as e:
-            md_parts.append(f"<!-- Page {i} error: {e} -->")
-            log(f"    [{pdf_path.name}] Page {i} error: {e}")
+            if use_vision:
+                page_md = convert_page_vision(vision_pages[i], client)
+            else:
+                if len(text) < MIN_TEXT_LENGTH:
+                    md_parts.append(f"<!-- Page {i+1}: no extractable content -->")
+                    log(f"    [{pdf_path.name}] Page {i+1}/{total_pages} skipped (empty)")
+                    continue
+                page_md = convert_page_text(text, client)
 
-        if i < len(pages):
+            md_parts.append(page_md)
+            log(f"    [{pdf_path.name}] Page {i+1}/{total_pages} done")
+        except Exception as e:
+            md_parts.append(f"<!-- Page {i+1} error: {e} -->")
+            log(f"    [{pdf_path.name}] Page {i+1} error: {e}")
+
+        if i < total_pages - 1:
             time.sleep(SLEEP_BETWEEN_PAGES)
 
     return "\n\n---\n\n".join(md_parts)
@@ -154,7 +234,7 @@ def mirror_structure_and_convert(input_folder: str) -> None:
 
     total = len(pdf_files)
     print(f"Found {total} PDF(s). Output → {output_root}")
-    print(f"Running with {MAX_WORKERS} parallel workers\n")
+    print(f"Running with {MAX_WORKERS} parallel workers (hybrid mode)\n")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
