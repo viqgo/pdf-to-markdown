@@ -38,8 +38,8 @@ MODEL               = "gpt-4o"
 MAX_TOKENS          = 4096         # per page — increase if pages get cut off
 DPI                 = 100          # lowered from 150 for faster processing
 OUTPUT_SUFFIX       = "_md"        # input folder + this suffix = output folder
-SLEEP_BETWEEN_PAGES = 0.1          # seconds between pages within a PDF
-MAX_WORKERS         = 5            # PDFs processed in parallel — reduce to 3 if you hit rate limits
+SLEEP_BETWEEN_PAGES = 1          # seconds between pages within a PDF
+MAX_WORKERS         = 2           # PDFs processed in parallel — reduce to 3 if you hit rate limits
 # ───────────────────────────────────────────────────────────────────────────────
 
 PROMPT = """Convert this PDF page to markdown for study notes.
